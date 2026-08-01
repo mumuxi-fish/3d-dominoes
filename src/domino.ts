@@ -1,8 +1,8 @@
 import * as THREE from 'three'
 import * as CANNON from 'cannon-es'
-import { config, getSelectedColor } from './config'
-import { playImpact } from './sound'
+import { config, dominoSize } from './config'
 
+/** 一个骨牌的数据(可序列化,用于保存/撤销) */
 export interface DominoData {
   id: number
   x: number
@@ -14,89 +14,73 @@ export interface DominoData {
   d?: number
 }
 
+/** 运行时对象:网格 + 物理刚体 */
 export interface DominoObject {
   data: DominoData
   mesh: THREE.Mesh
   body: CANNON.Body
 }
 
-// Read effective dimensions from data or config
-export function dominoW(d?: DominoData) { return d?.w ?? config.width }
-export function dominoH(d?: DominoData) { return d?.h ?? config.height }
-export function dominoD(d?: DominoData) { return d?.d ?? config.depth }
+// —— 共享资源缓存:同尺寸同颜色的骨牌复用几何体/材质,避免频繁创建 ——
+const geoCache = new Map<string, THREE.BoxGeometry>()
+const matCache = new Map<number, THREE.MeshPhysicalMaterial>()
 
-// --- Physics ---
-export function createPhysicsWorld(): CANNON.World {
-  const world = new CANNON.World()
-  world.gravity.set(0, -9.82, 0)
-  world.broadphase = new CANNON.SAPBroadphase(world)
-  world.allowSleep = true
-  // More solver iterations for accurate contact resolution (domino chains need it)
-  ;(world.solver as any).iterations = 10
+export function dominoW(d?: DominoData) { return d?.w ?? dominoSize().w }
+export function dominoH(d?: DominoData) { return d?.h ?? dominoSize().h }
+export function dominoD(d?: DominoData) { return d?.d ?? dominoSize().d }
 
-  const defaultMat = new CANNON.Material('default')
-  const contactMat = new CANNON.ContactMaterial(defaultMat, defaultMat, {
-    friction: config.friction,
-    restitution: config.restitution,
-  })
-  world.addContactMaterial(contactMat)
-
-  // Ground
-  const groundBody = new CANNON.Body({ mass: 0, material: defaultMat })
-  groundBody.addShape(new CANNON.Plane())
-  groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2)
-  world.addBody(groundBody)
-
-  return world
+export function getBoxGeometry(w: number, h: number, d: number): THREE.BoxGeometry {
+  const key = `${w.toFixed(3)}:${h.toFixed(3)}:${d.toFixed(3)}`
+  let geo = geoCache.get(key)
+  if (!geo) {
+    geo = new THREE.BoxGeometry(w, h, d)
+    geoCache.set(key, geo)
+  }
+  return geo
 }
 
-let nextId = 1
+export function getDominoMaterial(color: number): THREE.MeshPhysicalMaterial {
+  let mat = matCache.get(color)
+  if (!mat) {
+    mat = new THREE.MeshPhysicalMaterial({
+      color,
+      roughness: 0.5,
+      metalness: 0.05,
+      clearcoat: 0.25,
+      clearcoatRoughness: 0.35,
+    })
+    matCache.set(color, mat)
+  }
+  return mat
+}
 
-export function createDominoMesh(color: number): THREE.Mesh {
-  const w = config.width
-  const h = config.height
-  const d = config.depth
-  const geo = new THREE.BoxGeometry(w, h, d)
-  const mat = new THREE.MeshPhysicalMaterial({
-    color,
-    roughness: 0.4,
-    metalness: 0.1,
-    clearcoat: 0.1,
-  })
-  const mesh = new THREE.Mesh(geo, mat)
+export function createDominoMesh(color: number, w: number, h: number, d: number): THREE.Mesh {
+  const mesh = new THREE.Mesh(getBoxGeometry(w, h, d), getDominoMaterial(color))
   mesh.castShadow = true
   mesh.receiveShadow = true
   return mesh
 }
 
-export function createDominoBody(): CANNON.Body {
-  const w = config.width
-  const h = config.height
-  const d = config.depth
-  const mat = new CANNON.Material('domino')
-  const body = new CANNON.Body({
-    mass: config.mass,
-    material: mat,
-    linearDamping: 0.1,
-    angularDamping: config.angularDamping,
-    shape: new CANNON.Box(new CANNON.Vec3(w / 2, h / 2, d / 2)),
-  })
-  body.type = CANNON.Body.KINEMATIC
-  return body
+// —— ID 管理 ——
+let nextId = 1
+export function generateId(): number { return nextId++ }
+export function resetIdCounter() { nextId = 1 }
+export function syncIdCounter(maxId: number) {
+  if (maxId >= nextId) nextId = maxId + 1
 }
 
+// —— 构建 / 移除 ——
 export function buildDomino(
   scene: THREE.Scene,
   world: CANNON.World,
-  data: DominoData
+  data: DominoData,
 ): DominoObject {
-  // Store current dimensions in data for persistence
-  data.w = data.w ?? config.width
-  data.h = data.h ?? config.height
-  data.d = data.d ?? config.depth
+  data.w = data.w ?? dominoSize().w
+  data.h = data.h ?? dominoSize().h
+  data.d = data.d ?? dominoSize().d
 
-  const mesh = createDominoMesh(data.color)
-  const body = createDominoBody()
+  const mesh = createDominoMesh(data.color, data.w, data.h, data.d)
+  const body = createBody(data.w, data.h, data.d)
 
   const h2 = data.h / 2
   body.position.set(data.x, h2, data.z)
@@ -104,102 +88,30 @@ export function buildDomino(
 
   mesh.position.set(data.x, h2, data.z)
   mesh.rotation.y = data.rotation
-
-  // Use stored dimensions for mesh
-  mesh.geometry.dispose()
-  mesh.geometry = new THREE.BoxGeometry(data.w, data.h, data.d)
+  // 立即更新世界矩阵,保证刚创建的 mesh 可被 raycast 命中
+  mesh.updateMatrixWorld()
 
   scene.add(mesh)
   world.addBody(body)
-
   return { data, mesh, body }
 }
 
 export function removeDomino(obj: DominoObject, scene: THREE.Scene, world: CANNON.World) {
   scene.remove(obj.mesh)
   world.removeBody(obj.body)
-  obj.mesh.geometry.dispose()
-  if (Array.isArray(obj.mesh.material)) {
-    obj.mesh.material.forEach(m => m.dispose())
-  } else {
-    obj.mesh.material.dispose()
-  }
+  // 几何体/材质为共享缓存,不在此处 dispose
 }
 
-export function generateId(): number {
-  return nextId++
-}
-
-export function resetIdCounter() {
-  nextId = 1
-}
-
-export function syncIdCounter(maxId: number) {
-  if (maxId >= nextId) {
-    nextId = maxId + 1
-  }
-}
-
-export function activatePhysics(dominoes: DominoObject[], world: CANNON.World) {
-  for (const d of dominoes) {
-    d.body.type = CANNON.Body.DYNAMIC
-    d.body.mass = config.mass
-    d.body.updateMassProperties()
-    d.body.wakeUp()
-  }
-}
-
-/**
- * Apply topple impulse to a specific domino.
- * @param target - domino to push
- * @param direction - world-space push direction (normalized)
- */
-/**
- * Set up collision event listener on a body for sound effects.
- * Only fires when body is dynamic (physics active).
- */
-export function setupBodyCollisionSound(body: CANNON.Body) {
-  body.addEventListener(CANNON.Body.COLLIDE_EVENT_NAME, (event: any) => {
-    if (body.type !== CANNON.Body.DYNAMIC) return
-    try {
-      const contact = event.contact
-      const impactVel = contact.getImpactVelocityAlongNormal()
-      if (Math.abs(impactVel) > 0.5) {
-        const strength = Math.min(1, Math.abs(impactVel) / 8)
-        playImpact(strength)
-      }
-    } catch {
-      // ignore if contact info isn't available
-    }
+/** 创建物理刚体(编辑态为 KINEMATIC,静止) */
+export function createBody(w: number, h: number, d: number): CANNON.Body {
+  const mat = new CANNON.Material('domino')
+  const body = new CANNON.Body({
+    mass: config.mass,
+    material: mat,
+    linearDamping: 0.05,
+    angularDamping: config.angularDamping,
+    shape: new CANNON.Box(new CANNON.Vec3(w / 2, h / 2, d / 2)),
   })
-}
-
-export function toppleDominoAt(target: DominoObject, direction: CANNON.Vec3) {
-  const h = dominoH(target.data)
-  const dir = direction.clone()
-  dir.scale(config.impulseStrength, dir)
-
-  const wp = new CANNON.Vec3(
-    target.body.position.x,
-    h * 0.85,
-    target.body.position.z
-  )
-  target.body.applyImpulse(dir, wp)
-}
-
-export function resetPhysics(dominoes: DominoObject[], world: CANNON.World) {
-  for (const d of dominoes) {
-    world.removeBody(d.body)
-  }
-  for (const d of dominoes) {
-    const h = dominoH(d.data)
-    const newBody = createDominoBody()
-    newBody.position.set(d.data.x, h / 2, d.data.z)
-    newBody.quaternion.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), d.data.rotation)
-    d.body = newBody
-    world.addBody(newBody)
-
-    d.mesh.position.set(d.data.x, h / 2, d.data.z)
-    d.mesh.rotation.y = d.data.rotation
-  }
+  body.type = CANNON.Body.KINEMATIC
+  return body
 }

@@ -3,16 +3,32 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import * as CANNON from 'cannon-es'
 import {
   buildDomino, removeDomino, generateId, resetIdCounter, syncIdCounter,
-  activatePhysics, toppleDominoAt, resetPhysics, createPhysicsWorld,
-  setupBodyCollisionSound,
-  DominoData, DominoObject, dominoW,
+  DominoData, DominoObject, dominoW, dominoH, dominoD, getBoxGeometry,
 } from './domino'
-import { config, getSelectedColor } from './config'
-import { saveToLocal, loadFromLocal, exportToFile, importFromFile } from './storage'
-import { playPlace, playDelete } from './sound'
+import { config, getSelectedColor, dominoSize, dominoSpacing } from './config'
+import {
+  createPhysicsWorld, activatePhysics, toppleDominoAt, resetPhysics, facingVector,
+} from './physics'
+import { saveToLocal } from './storage'
+import { playPlace, playDelete, playImpact, unlockAudio } from './sound'
 import { TEMPLATES, TemplateDef } from './templates'
 
-export type ToolMode = 'place' | 'delete' | 'move'
+export type ToolMode = 'place' | 'move' | 'delete'
+
+const BOUNDARY = 9          // 放置边界(±9)
+const DRAG_THRESHOLD = 0.2  // 拖拽判定阈值(世界单位)
+const UNDO_LIMIT = 100
+
+interface Gesture {
+  pointerId: number
+  kind: 'place' | 'move' | 'delete'
+  startPos: THREE.Vector3
+  lastPlaced: THREE.Vector3 | null
+  moved: boolean
+  movedDomino: DominoObject | null
+  deletedIds: Set<number>
+  startSnapshot: DominoData[]
+}
 
 export class DominoScene {
   private scene!: THREE.Scene
@@ -24,35 +40,35 @@ export class DominoScene {
   private dominoes: DominoObject[] = []
   private clock = new THREE.Clock()
 
-  // Tool state
+  // 工具状态
   private toolMode: ToolMode = 'place'
   private isPlaying = false
   private toppleTriggered = false
+  private pendingRotation = 0
 
-  // Hover highlight
+  // 手势 / 悬停
+  private gesture: Gesture | null = null
   private hoveredDomino: DominoObject | null = null
   private hoverHighlight: THREE.Mesh | null = null
+  private ghost: THREE.Mesh | null = null
+  private ghostMarker: THREE.Mesh | null = null
+  private ghostVisible = false
 
-  // Raycasting
+  // 射线
   private raycaster = new THREE.Raycaster()
   private mouse = new THREE.Vector2()
   private groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)
 
-  // Line drawing state
-  private isShiftDown = false
-  private lineStart: THREE.Vector3 | null = null
+  // 撤销 / 重做
+  private undoStack: DominoData[][] = []
+  private redoStack: DominoData[][] = []
 
-  // Selected domino for delete/move
-  private selectedDomino: DominoObject | null = null
-  private selectionRing: THREE.Mesh | null = null
-
-  // Placement rotation
-  private pendingRotation = 0
-
-  // Callbacks
-  private onCountChange!: (n: number) => void
-  private onPlayChange!: (playing: boolean) => void
-  private onRotationChange!: (angle: number) => void
+  // 回调
+  private onCountChange: (n: number) => void = () => {}
+  private onPlayChange: (playing: boolean) => void = () => {}
+  private onRotationChange: (angle: number) => void = () => {}
+  private onHistoryChange: () => void = () => {}
+  private onToolChange: (mode: ToolMode) => void = () => {}
 
   constructor(container: HTMLElement) {
     this.init(container)
@@ -60,37 +76,29 @@ export class DominoScene {
   }
 
   setCallbacks(cbs: {
-    onCountChange: (n: number) => void
-    onPlayChange: (playing: boolean) => void
+    onCountChange?: (n: number) => void
+    onPlayChange?: (playing: boolean) => void
     onRotationChange?: (angle: number) => void
+    onHistoryChange?: () => void
+    onToolChange?: (mode: ToolMode) => void
   }) {
-    this.onCountChange = cbs.onCountChange
-    this.onPlayChange = cbs.onPlayChange
-    this.onRotationChange = cbs.onRotationChange ?? (() => {})
+    if (cbs.onCountChange) this.onCountChange = cbs.onCountChange
+    if (cbs.onPlayChange) this.onPlayChange = cbs.onPlayChange
+    if (cbs.onRotationChange) this.onRotationChange = cbs.onRotationChange
+    if (cbs.onHistoryChange) this.onHistoryChange = cbs.onHistoryChange
+    if (cbs.onToolChange) this.onToolChange = cbs.onToolChange
   }
 
-  /** Rebuild physics world with current config friction/restitution */
-  rebuildPhysicsWorld() {
-    // Remove old world bodies (except dominoes — those will be re-added)
-    for (const d of this.dominoes) {
-      this.world.removeBody(d.body)
-    }
-    this.world = createPhysicsWorld()
-    for (const d of this.dominoes) {
-      this.world.addBody(d.body)
-    }
-  }
-
-  // ======== Init ========
+  // ======== 初始化 ========
   private init(container: HTMLElement) {
     this.scene = new THREE.Scene()
-    this.scene.background = new THREE.Color(0x1a1a2e)
-    this.scene.fog = new THREE.Fog(0x1a1a2e, 20, 40)
+    this.scene.background = new THREE.Color(0xeaf2fb)
+    this.scene.fog = new THREE.Fog(0xeaf2fb, 28, 65)
 
     const aspect = container.clientWidth / container.clientHeight
-    this.camera = new THREE.PerspectiveCamera(50, aspect, 0.1, 100)
-    this.camera.position.set(8, 6, 8)
-    this.camera.lookAt(0, 0, 0)
+    this.camera = new THREE.PerspectiveCamera(50, aspect, 0.1, 120)
+    this.camera.position.set(9, 7, 10)
+    this.camera.lookAt(0, 0.5, 0)
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true })
     this.renderer.setSize(container.clientWidth, container.clientHeight)
@@ -98,22 +106,26 @@ export class DominoScene {
     this.renderer.shadowMap.enabled = true
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping
-    this.renderer.toneMappingExposure = 1.2
+    this.renderer.toneMappingExposure = 1.1
     container.appendChild(this.renderer.domElement)
 
-    // OrbitControls: middle button rotates, right button pans
+    // 右键拖 = 旋转视角;中键拖 = 平移;滚轮 = 缩放
     this.controls = new OrbitControls(this.camera, this.renderer.domElement)
     this.controls.enableDamping = true
     this.controls.dampingFactor = 0.1
     this.controls.minDistance = 2
-    this.controls.maxDistance = 30
-    this.controls.maxPolarAngle = Math.PI / 2.05
+    this.controls.maxDistance = 40
+    this.controls.maxPolarAngle = Math.PI / 2.02
     this.controls.target.set(0, 0.5, 0)
-    // <<< MIDDLE BUTTON ROTATE, RIGHT BUTTON ZOOM >>>
     this.controls.mouseButtons = {
       LEFT: null,
-      MIDDLE: THREE.MOUSE.ROTATE,
-      RIGHT: THREE.MOUSE.DOLLY,
+      MIDDLE: THREE.MOUSE.PAN,
+      RIGHT: THREE.MOUSE.ROTATE,
+    }
+    // 触屏:单指留给操作,双指旋转/缩放
+    this.controls.touches = {
+      ONE: null as any,
+      TWO: THREE.TOUCH.DOLLY_ROTATE as any,
     }
 
     this.world = createPhysicsWorld()
@@ -122,359 +134,527 @@ export class DominoScene {
     this.setupGround()
     this.setupEvents()
 
-    window.addEventListener('resize', () => this.onResize(container))
+    this.containerEl = container
+    window.addEventListener('resize', this.onResizeHandler)
   }
 
   private setupLights() {
-    const ambient = new THREE.AmbientLight(0x404060, 0.5)
+    const ambient = new THREE.AmbientLight(0xffffff, 0.6)
     this.scene.add(ambient)
-    const hemi = new THREE.HemisphereLight(0x8888ff, 0x444422, 0.6)
+    const hemi = new THREE.HemisphereLight(0xdfe9ff, 0xf2e6d0, 0.9)
     this.scene.add(hemi)
 
-    const sun = new THREE.DirectionalLight(0xffeedd, 1.5)
-    sun.position.set(10, 15, 8)
+    const sun = new THREE.DirectionalLight(0xfff6e0, 1.5)
+    sun.position.set(8, 14, 6)
     sun.castShadow = true
     sun.shadow.mapSize.width = 2048
     sun.shadow.mapSize.height = 2048
     sun.shadow.camera.near = 0.5
     sun.shadow.camera.far = 40
-    sun.shadow.camera.left = -15
-    sun.shadow.camera.right = 15
-    sun.shadow.camera.top = 15
-    sun.shadow.camera.bottom = -15
+    sun.shadow.camera.left = -14
+    sun.shadow.camera.right = 14
+    sun.shadow.camera.top = 14
+    sun.shadow.camera.bottom = -14
+    sun.shadow.bias = -0.0005
     this.scene.add(sun)
 
-    const fill = new THREE.DirectionalLight(0x8888ff, 0.4)
-    fill.position.set(-5, 3, -8)
+    const fill = new THREE.DirectionalLight(0xdfe8ff, 0.5)
+    fill.position.set(-6, 4, -8)
     this.scene.add(fill)
   }
 
   private setupGround() {
     const gridSize = 20
-    const gridHelper = new THREE.GridHelper(gridSize, 20, 0x6666aa, 0x444466)
-    gridHelper.position.y = -0.01
+    const gridHelper = new THREE.GridHelper(gridSize, 20, 0xb9cbe0, 0xdde8f3)
+    gridHelper.position.y = 0
     this.scene.add(gridHelper)
 
     const planeGeo = new THREE.PlaneGeometry(gridSize, gridSize)
     const planeMat = new THREE.MeshStandardMaterial({
-      transparent: true,
-      opacity: 0.3,
-      color: 0x2a2a4a,
-      roughness: 1,
+      color: 0xf4f8fc,
+      roughness: 0.95,
       metalness: 0,
-      side: THREE.DoubleSide,
     })
     const planeMesh = new THREE.Mesh(planeGeo, planeMat)
     planeMesh.rotation.x = -Math.PI / 2
-    planeMesh.position.y = -0.01
+    planeMesh.position.y = -0.005
     planeMesh.receiveShadow = true
     this.scene.add(planeMesh)
   }
 
-  // ======== Events ========
+  // ======== 事件 ========
   private setupEvents() {
     const canvas = this.renderer.domElement
 
-    canvas.addEventListener('mousedown', (e) => this.onMouseDown(e))
-    canvas.addEventListener('mousemove', (e) => this.onMouseMove(e))
-    canvas.addEventListener('mouseup', () => this.onMouseUp())
-    canvas.addEventListener('dblclick', (e) => this.onDoubleClick(e))
+    canvas.addEventListener('pointerdown', (e) => this.onPointerDown(e))
+    canvas.addEventListener('pointermove', (e) => this.onPointerMove(e))
+    canvas.addEventListener('pointerup', (e) => this.onPointerUp(e))
+    canvas.addEventListener('pointercancel', (e) => this.onPointerUp(e))
+    canvas.addEventListener('pointerleave', () => {
+      if (!this.gesture) this.hideGhost()
+    })
     canvas.addEventListener('contextmenu', (e) => e.preventDefault())
 
-    window.addEventListener('keydown', (e) => {
-      if (e.key === 'Shift') this.isShiftDown = true
-      if (e.key === '1') this.setTool('place')
-      if (e.key === '2') this.setTool('delete')
-      if (e.key === '3') this.setTool('move')
-      if (e.key === 'r' || e.key === 'R') {
-        if (this.toolMode === 'place') {
-          this.pendingRotation = (this.pendingRotation + Math.PI / 4) % (Math.PI * 2)
-          this.onRotationChange(this.pendingRotation)
-        }
-      }
-      if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (this.selectedDomino) {
-          this.deleteDomino(this.selectedDomino)
-          this.selectedDomino = null
-          this.removeSelectionRing()
-        }
-      }
-    })
-    window.addEventListener('keyup', (e) => {
-      if (e.key === 'Shift') {
-        this.isShiftDown = false
-        this.lineStart = null
-      }
-    })
+    window.addEventListener('keydown', this.onKeyDownHandler)
   }
 
-  private getGroundIntersection(clientX: number, clientY: number): THREE.Vector3 | null {
+  /** 全局键盘快捷键(聚焦输入框时不响应) */
+  private onKeyDownHandler = (e: KeyboardEvent) => {
+    const target = e.target as HTMLElement | null
+    const tag = target?.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target?.isContentEditable) return
+
+    if (this.isPlaying) {
+      if (e.key === 'Escape') this.resetPlay()
+      return
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+      e.preventDefault()
+      if (e.shiftKey) this.redo()
+      else this.undo()
+      return
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'y') {
+      e.preventDefault()
+      this.redo()
+      return
+    }
+    if (e.key === '1') this.setTool('place')
+    if (e.key === '2') this.setTool('move')
+    if (e.key === '3') this.setTool('delete')
+    if (e.key === 'r' || e.key === 'R') this.rotatePending()
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      e.preventDefault()
+      this.deleteLast()
+    }
+    if (e.key === 'Escape') {
+      // 取消进行中的手势并回滚到手势前状态
+      const g = this.gesture
+      this.gesture = null
+      this.hideGhost()
+      if (g) this.restore(g.startSnapshot)
+    }
+  }
+
+  // ======== 射线工具 ========
+  private groundHit(clientX: number, clientY: number): THREE.Vector3 | null {
     this.mouse.x = (clientX / this.renderer.domElement.clientWidth) * 2 - 1
     this.mouse.y = -(clientY / this.renderer.domElement.clientHeight) * 2 + 1
     this.raycaster.setFromCamera(this.mouse, this.camera)
-    const intersect = new THREE.Vector3()
     const ray = this.raycaster.ray
     const denom = ray.direction.dot(this.groundPlane.normal)
     if (Math.abs(denom) < 1e-6) return null
     const t = -(ray.origin.dot(this.groundPlane.normal) + this.groundPlane.constant) / denom
     if (t < 0) return null
-    intersect.copy(ray.origin).add(ray.direction.clone().multiplyScalar(t))
-    return intersect
+    const out = new THREE.Vector3().copy(ray.origin).addScaledVector(ray.direction, t)
+    out.x = Math.max(-BOUNDARY, Math.min(BOUNDARY, out.x))
+    out.z = Math.max(-BOUNDARY, Math.min(BOUNDARY, out.z))
+    return out
   }
 
-  private getDominoIntersection(
-    clientX: number,
-    clientY: number
-  ): { domino: DominoObject; worldNormal: THREE.Vector3 } | null {
+  private dominoHit(clientX: number, clientY: number): DominoObject | null {
     this.mouse.x = (clientX / this.renderer.domElement.clientWidth) * 2 - 1
     this.mouse.y = -(clientY / this.renderer.domElement.clientHeight) * 2 + 1
     this.raycaster.setFromCamera(this.mouse, this.camera)
-
     const meshes = this.dominoes.map(d => d.mesh)
-    const intersects = this.raycaster.intersectObjects(meshes)
-    if (intersects.length > 0) {
-      const hit = intersects[0]
-      const mesh = hit.object as THREE.Mesh
-      const domino = this.dominoes.find(d => d.mesh === mesh)
-      if (!domino) return null
-
-      // Transform face normal from local to world space
-      const localNormal = hit.face!.normal.clone()
-      const worldNormal = localNormal.applyQuaternion(mesh.quaternion)
-      worldNormal.normalize()
-
-      return { domino, worldNormal }
-    }
-    return null
+    const hits = this.raycaster.intersectObjects(meshes)
+    if (hits.length === 0) return null
+    const mesh = hits[0].object as THREE.Mesh
+    return this.dominoes.find(d => d.mesh === mesh) ?? null
   }
 
-  private onMouseDown(e: MouseEvent) {
-    if (e.button !== 0) return
+  /** 网格吸附 */
+  private snap(v: THREE.Vector3): THREE.Vector3 {
+    if (!config.snap) return v
+    const step = config.snapStep
+    return new THREE.Vector3(
+      Math.round(v.x / step) * step,
+      0,
+      Math.round(v.z / step) * step,
+    )
+  }
 
-    // --- PLAY MODE: click domino to topple ---
+  // ======== Pointer 处理 ========
+  private onPointerDown(e: PointerEvent) {
+    unlockAudio()
+    if (this.gesture) return
+
+    // 鼠标:只处理左键;触屏:主触点
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+    if (e.pointerType !== 'mouse' && !e.isPrimary) return
+    // 捕获指针,拖拽出画布也能收到事件
+    try { this.renderer.domElement.setPointerCapture(e.pointerId) } catch { /* ignore */ }
+    canvasFocus(e)
+
+    // —— 推倒模式:点击骨牌触发 ——
     if (this.isPlaying) {
-      const hit = this.getDominoIntersection(e.clientX, e.clientY)
-      if (hit) {
-        if (!this.toppleTriggered) {
-          activatePhysics(this.dominoes, this.world)
-          this.toppleTriggered = true
-        }
-        // Push away from the clicked face (fall toward opposite side)
-        const dir = new CANNON.Vec3(
-          -hit.worldNormal.x,
-          0,
-          -hit.worldNormal.z
-        )
-        dir.normalize()
-        toppleDominoAt(hit.domino, dir)
-        // Clean up hover afterimage
-        this.removeHoverHighlight()
-        this.hoveredDomino = null
+      const domino = this.dominoHit(e.clientX, e.clientY)
+      if (domino) {
+        this.topple(domino)
       }
       return
     }
 
+    const pos = this.groundHit(e.clientX, e.clientY)
+    if (!pos) return
+
     if (this.toolMode === 'place') {
-      if (this.isShiftDown) {
-        const pos = this.getGroundIntersection(e.clientX, e.clientY)
-        if (pos) {
-          this.lineStart = pos.clone()
-          this.placeDomino(pos.x, pos.z)
-        }
-      } else {
-        const pos = this.getGroundIntersection(e.clientX, e.clientY)
-        if (pos) {
-          this.placeDomino(pos.x, pos.z, this.pendingRotation)
+      const snapped = this.snap(pos)
+      this.gesture = {
+        pointerId: e.pointerId,
+        kind: 'place',
+        startPos: snapped,
+        lastPlaced: null,
+        moved: false,
+        movedDomino: null,
+        deletedIds: new Set(),
+        startSnapshot: this.snapshot(),
+      }
+      this.hideGhost()
+      this.renderer.domElement.style.cursor = 'crosshair'
+    } else if (this.toolMode === 'move') {
+      const domino = this.dominoHit(e.clientX, e.clientY)
+      if (domino) {
+        this.setHover(null)
+        this.renderer.domElement.style.cursor = 'grabbing'
+        this.gesture = {
+          pointerId: e.pointerId,
+          kind: 'move',
+          startPos: pos.clone(),
+          lastPlaced: null,
+          moved: false,
+          movedDomino: domino,
+          deletedIds: new Set(),
+          startSnapshot: this.snapshot(),
         }
       }
     } else if (this.toolMode === 'delete') {
-      const hit = this.getDominoIntersection(e.clientX, e.clientY)
-      const domino = hit?.domino ?? null
+      const domino = this.dominoHit(e.clientX, e.clientY)
       if (domino) {
-        if (this.selectedDomino === domino) {
-          this.deleteDomino(domino)
-          this.selectedDomino = null
-          this.removeSelectionRing()
-        } else {
-          this.selectedDomino = domino
-          this.showSelectionRing(domino)
+        // 先记录手势前快照,再删除(保证撤销点正确)
+        this.gesture = {
+          pointerId: e.pointerId,
+          kind: 'delete',
+          startPos: pos.clone(),
+          lastPlaced: null,
+          moved: false,
+          movedDomino: null,
+          deletedIds: new Set([domino.data.id]),
+          startSnapshot: this.snapshot(),
         }
-      } else {
-        this.selectedDomino = null
-        this.removeSelectionRing()
-      }
-    } else if (this.toolMode === 'move') {
-      const hit = this.getDominoIntersection(e.clientX, e.clientY)
-      const domino = hit?.domino ?? null
-      if (domino) {
-        this.selectedDomino = domino
-        this.showSelectionRing(domino)
-      } else {
-        this.selectedDomino = null
-        this.removeSelectionRing()
+        this.deleteDominoAt(domino)
+        this.renderer.domElement.style.cursor = 'pointer'
       }
     }
   }
 
-  private onMouseMove(e: MouseEvent) {
-    // --- Play mode hover highlight ---
-    if (this.isPlaying) {
-      const hit = this.getDominoIntersection(e.clientX, e.clientY)
-      const domino = hit?.domino ?? null
+  private onPointerMove(e: PointerEvent) {
+    // 右键旋转视角时不做交互
+    if (e.pointerType === 'mouse' && (e.buttons & 2)) {
+      this.hideGhost()
+      return
+    }
+
+    const g = this.gesture
+
+    // —— 推倒模式:悬停高亮 ——
+    if (this.isPlaying && !g) {
+      const domino = this.dominoHit(e.clientX, e.clientY)
       if (domino !== this.hoveredDomino) {
-        this.removeHoverHighlight()
-        if (domino) {
-          this.showHoverHighlight(domino)
-        }
-        this.hoveredDomino = domino
-        this.renderer.domElement.style.cursor = domino ? 'pointer' : 'crosshair'
+        this.setHover(domino)
+        this.renderer.domElement.style.cursor = domino ? 'pointer' : 'default'
       }
       return
     }
 
-    if (this.toolMode === 'place' && this.isShiftDown && this.lineStart) {
-      const pos = this.getGroundIntersection(e.clientX, e.clientY)
-      if (pos) {
-        const dx = pos.x - this.lineStart.x
-        const dz = pos.z - this.lineStart.z
-        const dist = Math.sqrt(dx * dx + dz * dz)
-        const spacing = dominoW() + config.gap
-        if (dist > spacing) {
-          const angle = Math.atan2(dz, dx)
-          const count = Math.floor(dist / spacing)
-          for (let i = 0; i < count; i++) {
-            const ratio = (i + 1) / count
-            const x = this.lineStart.x + dx * ratio
-            const z = this.lineStart.z + dz * ratio
-            this.placeDomino(x, z, -angle)
-          }
-          this.lineStart = pos.clone()
-        }
+    if (!g) {
+      // 放置模式:更新 ghost 预览
+      if (this.toolMode === 'place' && !this.isPlaying) {
+        const pos = this.groundHit(e.clientX, e.clientY)
+        if (pos) this.showGhost(this.snap(pos))
+        else this.hideGhost()
+      }
+      return
+    }
+
+    if (e.pointerId !== g.pointerId) return
+    const pos = this.groundHit(e.clientX, e.clientY)
+    if (!pos) return
+
+    if (g.kind === 'place') {
+      this.placeDrag(g, pos)
+    } else if (g.kind === 'move') {
+      this.moveDrag(g, pos)
+    } else if (g.kind === 'delete') {
+      const domino = this.dominoHit(e.clientX, e.clientY)
+      if (domino && !g.deletedIds.has(domino.data.id)) {
+        g.deletedIds.add(domino.data.id)
+        this.deleteDominoAt(domino)
       }
     }
   }
 
-  private onMouseUp() {
-    this.lineStart = null
-  }
+  private onPointerUp(e: PointerEvent) {
+    const g = this.gesture
+    if (!g || e.pointerId !== g.pointerId) return
+    this.gesture = null
 
-  private onDoubleClick(e: MouseEvent) {
-    if (this.toolMode === 'delete') {
-      const hit = this.getDominoIntersection(e.clientX, e.clientY)
-      const domino = hit?.domino ?? null
-      if (domino) {
-        this.deleteDomino(domino)
-        if (this.selectedDomino === domino) {
-          this.selectedDomino = null
-          this.removeSelectionRing()
-        }
+    let changed = this.snapshot().length !== g.startSnapshot.length
+      || this.snapshotChanged(g.startSnapshot)
+
+    if (g.kind === 'place') {
+      if (!g.moved) {
+        // 单击:用当前方向放一块
+        this.placeDominoAt(g.startPos.x, g.startPos.z, this.pendingRotation)
+        changed = true
       }
+      this.renderer.domElement.style.cursor = 'crosshair'
+    } else if (g.kind === 'move') {
+      this.renderer.domElement.style.cursor = g.moved ? 'default' : 'grab'
+    }
+
+    if (changed) this.commit(g.startSnapshot)
+    else this.hideGhost()
+
+    // 恢复当前工具的光标
+    if (!this.isPlaying) {
+      this.renderer.domElement.style.cursor = this.toolMode === 'place' ? 'crosshair'
+        : this.toolMode === 'move' ? 'grab' : 'default'
     }
   }
 
-  // ======== Domino Operations ========
-  placeDomino(x: number, z: number, rotation?: number) {
+  // ======== 手势逻辑 ========
+  private placeDrag(g: Gesture, pos: THREE.Vector3) {
+    const dx = pos.x - g.startPos.x
+    const dz = pos.z - g.startPos.z
+    const dist = Math.sqrt(dx * dx + dz * dz)
+
+    if (!g.moved) {
+      if (dist < DRAG_THRESHOLD) return
+      g.moved = true
+      // 起点块:朝向拖拽方向(骨牌前方 = 拖拽方向,连锁沿拖拽线)
+      const angle = Math.atan2(dx, dz)
+      g.lastPlaced = g.startPos.clone()
+      this.placeDominoAt(g.startPos.x, g.startPos.z, angle)
+      playPlace()
+    }
+
+    // 从上次放置点朝当前指针位置逐步铺排
+    const spacing = dominoSpacing()
+    let guard = 0
+    while (g.lastPlaced && guard < 1000) {
+      const lx = g.lastPlaced.x
+      const lz = g.lastPlaced.z
+      const ddx = pos.x - lx
+      const ddz = pos.z - lz
+      const stepDist = Math.sqrt(ddx * ddx + ddz * ddz)
+      if (stepDist < spacing) break
+      const angle = Math.atan2(ddx, ddz)
+      g.lastPlaced = new THREE.Vector3(
+        lx + (ddx / stepDist) * spacing,
+        0,
+        lz + (ddz / stepDist) * spacing,
+      )
+      this.placeDominoAt(g.lastPlaced.x, g.lastPlaced.z, angle)
+      playPlace()
+      guard++
+    }
+  }
+
+  private moveDrag(g: Gesture, pos: THREE.Vector3) {
+    const d = g.movedDomino
+    if (!d) return
+    const target = this.snap(pos)
+    d.data.x = target.x
+    d.data.z = target.z
+    const h2 = dominoH(d.data) / 2
+    d.mesh.position.set(target.x, h2, target.z)
+    d.body.position.set(target.x, h2, target.z)
+    g.moved = true
+  }
+
+  // ======== 骨牌操作 ========
+  placeDominoAt(x: number, z: number, rotation: number) {
     if (this.isPlaying) return
-    const halfSize = 9
-    x = Math.max(-halfSize, Math.min(halfSize, x))
-    z = Math.max(-halfSize, Math.min(halfSize, z))
-
+    x = Math.max(-BOUNDARY, Math.min(BOUNDARY, x))
+    z = Math.max(-BOUNDARY, Math.min(BOUNDARY, z))
     const data: DominoData = {
       id: generateId(),
       x, z,
-      rotation: rotation ?? 0,
+      rotation,
       color: getSelectedColor(),
     }
-
     const obj = buildDomino(this.scene, this.world, data)
     this.dominoes.push(obj)
-    this.onCountChange?.(this.dominoes.length)
-    playPlace()
+    this.onCountChange(this.dominoes.length)
   }
 
-  deleteDomino(obj: DominoObject) {
+  deleteDominoAt(obj: DominoObject) {
     const idx = this.dominoes.indexOf(obj)
     if (idx === -1) return
     removeDomino(obj, this.scene, this.world)
     this.dominoes.splice(idx, 1)
-    this.onCountChange?.(this.dominoes.length)
+    this.onCountChange(this.dominoes.length)
     playDelete()
+    if (this.hoveredDomino === obj) this.setHover(null)
   }
 
-  clearAll() {
-    for (const d of [...this.dominoes]) {
-      removeDomino(d, this.scene, this.world)
+  /** 删除最近放置的一块(Delete 键) */
+  deleteLast() {
+    if (this.isPlaying || this.dominoes.length === 0) return
+    const prev = this.snapshot()
+    const last = this.dominoes[this.dominoes.length - 1]
+    this.deleteDominoAt(last)
+    this.commit(prev)
+  }
+
+  // ======== 推倒 ========
+  private topple(domino: DominoObject) {
+    if (!this.toppleTriggered) {
+      activatePhysics(this.dominoes)
+      for (const d of this.dominoes) {
+        this.setupCollisionSound(d.body)
+      }
+      this.toppleTriggered = true
     }
-    this.dominoes = []
-    resetIdCounter()
-    this.selectedDomino = null
-    this.removeSelectionRing()
-    this.hoveredDomino = null
-    this.removeHoverHighlight()
-    this.isPlaying = false
+    // 朝骨牌前方推倒,连锁沿前方传导
+    toppleDominoAt(domino, facingVector(domino.data.rotation))
+    this.setHover(null)
+  }
+
+  private setupCollisionSound(body: CANNON.Body) {
+    body.addEventListener(CANNON.Body.COLLIDE_EVENT_NAME, (event: any) => {
+      if (body.type !== CANNON.Body.DYNAMIC) return
+      try {
+        const contact = event.contact
+        const v = contact.getImpactVelocityAlongNormal()
+        if (Math.abs(v) > 0.4) {
+          playImpact(Math.min(1, Math.abs(v) / 8))
+        }
+      } catch {
+        /* ignore */
+      }
+    })
+  }
+
+  /** 一键推倒:推倒第一块骨牌 */
+  autoTopple() {
+    if (this.dominoes.length === 0 || this.isPlaying) return
+    this.gesture = null
+    this.hideGhost()
+    this.isPlaying = true
     this.toppleTriggered = false
-    this.onPlayChange?.(false)
-    this.onCountChange?.(0)
-  }
+    this.onPlayChange(true)
+    this.renderer.domElement.style.cursor = 'crosshair'
 
-  // ======== Templates ========
-  applyTemplate(templateName: string) {
-    if (this.isPlaying) return
-    const tmpl = TEMPLATES.find(t => t.name === templateName)
-    if (!tmpl) return
-
-    this.clearAll()
-    const data = tmpl.generate()
-    let maxId = 0
-    for (const d of data) {
-      if (d.id > maxId) maxId = d.id
-      const obj = buildDomino(this.scene, this.world, d)
-      this.dominoes.push(obj)
+    const first = this.dominoes[0]
+    activatePhysics(this.dominoes)
+    for (const d of this.dominoes) {
+      this.setupCollisionSound(d.body)
     }
-    syncIdCounter(maxId)
-    this.onCountChange?.(this.dominoes.length)
-  }
-
-  getTemplates(): TemplateDef[] {
-    return TEMPLATES
+    this.toppleTriggered = true
+    toppleDominoAt(first, facingVector(first.data.rotation))
   }
 
   startPlay() {
     if (this.dominoes.length === 0 || this.isPlaying) return
+    this.gesture = null
+    this.hideGhost()
     this.isPlaying = true
     this.toppleTriggered = false
-    // Set up collision sound listeners
-    for (const d of this.dominoes) {
-      setupBodyCollisionSound(d.body)
-    }
-    this.onPlayChange?.(true)
+    this.onPlayChange(true)
     this.renderer.domElement.style.cursor = 'crosshair'
   }
 
   resetPlay() {
     if (!this.isPlaying) return
+    this.gesture = null
+    this.hideGhost()
     this.isPlaying = false
     this.toppleTriggered = false
-    this.onPlayChange?.(false)
+    this.onPlayChange(false)
     resetPhysics(this.dominoes, this.world)
-    this.selectedDomino = null
-    this.removeSelectionRing()
-    this.hoveredDomino = null
-    this.removeHoverHighlight()
+    this.setHover(null)
     this.renderer.domElement.style.cursor = ''
   }
 
-  // ======== Hover Highlight ========
-  private showHoverHighlight(obj: DominoObject) {
+  // ======== Ghost 预览 ========
+  private showGhost(pos: THREE.Vector3) {
+    if (!this.ghost || !this.ghostMarker) {
+      const size = dominoSize()
+      const geo = getBoxGeometry(size.w, size.h, size.d)
+      const mat = new THREE.MeshBasicMaterial({
+        color: getSelectedColor(),
+        transparent: true,
+        opacity: 0.4,
+        depthWrite: false,
+      })
+      this.ghost = new THREE.Mesh(geo, mat)
+      this.ghost.visible = false
+      this.scene.add(this.ghost)
+
+      const markerGeo = new THREE.SphereGeometry(0.05, 8, 8)
+      const markerMat = new THREE.MeshBasicMaterial({
+        color: getSelectedColor(),
+        transparent: true,
+        opacity: 0.9,
+        depthWrite: false,
+      })
+      this.ghostMarker = new THREE.Mesh(markerGeo, markerMat)
+      this.ghostMarker.visible = false
+      this.scene.add(this.ghostMarker)
+    }
+
+    const ghost = this.ghost!
+    const marker = this.ghostMarker!
+    const size = dominoSize()
+    const ghostMat = ghost.material as THREE.MeshBasicMaterial
+    ghostMat.color.setHex(getSelectedColor())
+    ;(marker.material as THREE.MeshBasicMaterial).color.setHex(getSelectedColor())
+
+    // 尺寸变化时更新几何体
+    const key = `${size.w.toFixed(3)}:${size.h.toFixed(3)}:${size.d.toFixed(3)}`
+    if (ghost.geometry !== getBoxGeometry(size.w, size.h, size.d)) {
+      ghost.geometry = getBoxGeometry(size.w, size.h, size.d)
+    }
+
+    const h2 = size.h / 2
+    ghost.position.set(pos.x, h2, pos.z)
+    ghost.rotation.set(0, this.pendingRotation, 0)
+    ghost.visible = true
+    marker.position.set(
+      pos.x + Math.sin(this.pendingRotation) * (size.d / 2 + 0.06),
+      h2,
+      pos.z + Math.cos(this.pendingRotation) * (size.d / 2 + 0.06),
+    )
+    marker.visible = true
+    this.ghostVisible = true
+  }
+
+  private hideGhost() {
+    if (!this.ghostVisible) return
+    this.ghostVisible = false
+    if (this.ghost) this.ghost.visible = false
+    if (this.ghostMarker) this.ghostMarker.visible = false
+  }
+
+  // ======== Hover 高亮 ========
+  private setHover(obj: DominoObject | null) {
+    if (obj === this.hoveredDomino) return
+    this.hoveredDomino = obj
     this.removeHoverHighlight()
-    const ow = obj.data.w ?? config.width
-    const oh = obj.data.h ?? config.height
-    const od = obj.data.d ?? config.depth
-    const geo = new THREE.BoxGeometry(ow + 0.08, oh + 0.08, od + 0.08)
+    if (obj) this.showHoverHighlight(obj)
+  }
+
+  private showHoverHighlight(obj: DominoObject) {
+    const w = dominoW(obj.data)
+    const h = dominoH(obj.data)
+    const d = dominoD(obj.data)
+    const geo = getBoxGeometry(w + 0.06, h + 0.06, d + 0.06)
     const mat = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
+      color: 0x6366f1,
       transparent: true,
-      opacity: 0.15,
+      opacity: 0.25,
       depthWrite: false,
     })
     this.hoverHighlight = new THREE.Mesh(geo, mat)
@@ -486,7 +666,6 @@ export class DominoScene {
   private removeHoverHighlight() {
     if (this.hoverHighlight) {
       this.scene.remove(this.hoverHighlight)
-      this.hoverHighlight.geometry.dispose()
       const mat = this.hoverHighlight.material
       if (Array.isArray(mat)) mat.forEach(m => m.dispose())
       else mat.dispose()
@@ -494,91 +673,209 @@ export class DominoScene {
     }
   }
 
-  // ======== Selection Ring ========
-  private showSelectionRing(obj: DominoObject) {
-    this.removeSelectionRing()
-    const ow = obj.data.w ?? config.width
-    const ringGeo = new THREE.RingGeometry(ow * 0.6, ow * 0.75, 32)
-    const ringMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: 0.4,
-      depthWrite: false,
-    })
-    this.selectionRing = new THREE.Mesh(ringGeo, ringMat)
-    this.selectionRing.rotation.x = -Math.PI / 2
-    this.selectionRing.position.set(obj.data.x, 0.02, obj.data.z)
-    this.scene.add(this.selectionRing)
-  }
-
-  private removeSelectionRing() {
-    if (this.selectionRing) {
-      this.scene.remove(this.selectionRing)
-      this.selectionRing.geometry.dispose()
-      if (Array.isArray(this.selectionRing.material)) {
-        this.selectionRing.material.forEach(m => m.dispose())
-      } else {
-        this.selectionRing.material.dispose()
-      }
-      this.selectionRing = null
-    }
-  }
-
-  // ======== Tool ========
+  // ======== 工具 ========
   setTool(mode: ToolMode) {
+    if (this.isPlaying) return
     this.toolMode = mode
-    if (mode !== 'delete') {
-      this.selectedDomino = null
-      this.removeSelectionRing()
+    this.gesture = null
+    this.setHover(null)
+    if (mode !== 'place') this.hideGhost()
+    this.onToolChange(this.toolMode)
+  }
+
+  /** 重建物理世界(高级参数:摩擦/弹性修改后调用) */
+  rebuildPhysicsWorld() {
+    if (this.isPlaying) return
+    for (const d of this.dominoes) {
+      this.world.removeBody(d.body)
+    }
+    this.world = createPhysicsWorld()
+    for (const d of this.dominoes) {
+      this.world.addBody(d.body)
     }
   }
 
   getTool(): ToolMode { return this.toolMode }
   getPendingRotation(): number { return this.pendingRotation }
 
-  // ======== Save/Load/Export/Import ========
-  save() {
-    const data = this.dominoes.map(d => d.data)
-    return saveToLocal(data)
+  rotatePending() {
+    this.pendingRotation = (this.pendingRotation + Math.PI / 4) % (Math.PI * 2)
+    this.onRotationChange(this.pendingRotation)
+    // 让 ghost 预览立即旋转
+    if (this.ghostVisible && this.ghost && this.ghostMarker) {
+      const size = dominoSize()
+      const h2 = size.h / 2
+      this.ghost.rotation.set(0, this.pendingRotation, 0)
+      this.ghostMarker.position.set(
+        this.ghost.position.x + Math.sin(this.pendingRotation) * (size.d / 2 + 0.06),
+        h2,
+        this.ghost.position.z + Math.cos(this.pendingRotation) * (size.d / 2 + 0.06),
+      )
+    }
   }
 
-  load() {
-    this.clearAll()
-    const data = loadFromLocal()
-    if (!data) return false
+  // ======== 撤销 / 重做 ========
+  private snapshot(): DominoData[] {
+    return this.dominoes.map(d => ({ ...d.data }))
+  }
+
+  private snapshotChanged(prev: DominoData[]): boolean {
+    const cur = this.dominoes
+    if (cur.length !== prev.length) return true
+    for (let i = 0; i < cur.length; i++) {
+      const a = cur[i].data
+      const b = prev[i]
+      if (a.id !== b.id || a.x !== b.x || a.z !== b.z || a.rotation !== b.rotation || a.color !== b.color) {
+        return true
+      }
+    }
+    return false
+  }
+
+  /** 手势结束后提交:记录撤销点 + 自动保存 */
+  private commit(prev: DominoData[]) {
+    this.undoStack.push(prev)
+    if (this.undoStack.length > UNDO_LIMIT) this.undoStack.shift()
+    this.redoStack.length = 0
+    this.onHistoryChange()
+    saveToLocal(this.snapshot())
+  }
+
+  canUndo(): boolean { return this.undoStack.length > 0 && !this.isPlaying }
+  canRedo(): boolean { return this.redoStack.length > 0 && !this.isPlaying }
+
+  undo() {
+    if (!this.canUndo()) return
+    this.redoStack.push(this.snapshot())
+    this.restore(this.undoStack.pop()!)
+    this.onHistoryChange()
+    saveToLocal(this.snapshot())
+  }
+
+  redo() {
+    if (!this.canRedo()) return
+    this.undoStack.push(this.snapshot())
+    this.restore(this.redoStack.pop()!)
+    this.onHistoryChange()
+    saveToLocal(this.snapshot())
+  }
+
+  private restore(data: DominoData[]) {
+    for (const d of [...this.dominoes]) {
+      removeDomino(d, this.scene, this.world)
+    }
+    this.dominoes = []
+    this.setHover(null)
     let maxId = 0
     for (const d of data) {
+      if (d.id > maxId) maxId = d.id
+      const obj = buildDomino(this.scene, this.world, { ...d })
+      this.dominoes.push(obj)
+    }
+    syncIdCounter(maxId)
+    this.onCountChange(this.dominoes.length)
+  }
+
+  // ======== 清空 / 模板 ========
+  hasDominoes(): boolean { return this.dominoes.length > 0 }
+
+  clearAll() {
+    if (this.isPlaying || this.dominoes.length === 0) return
+    const prev = this.snapshot()
+    for (const d of [...this.dominoes]) {
+      removeDomino(d, this.scene, this.world)
+    }
+    this.dominoes = []
+    resetIdCounter()
+    this.setHover(null)
+    this.hideGhost()
+    this.onCountChange(0)
+    this.commit(prev)
+  }
+
+  applyTemplate(templateName: string) {
+    if (this.isPlaying) return
+    const tmpl = TEMPLATES.find(t => t.name === templateName)
+    if (!tmpl) return
+
+    const prev = this.snapshot()
+    for (const d of [...this.dominoes]) {
+      removeDomino(d, this.scene, this.world)
+    }
+    this.dominoes = []
+    this.setHover(null)
+    resetIdCounter()
+
+    let maxId = 0
+    for (const d of tmpl.generate()) {
       if (d.id > maxId) maxId = d.id
       const obj = buildDomino(this.scene, this.world, d)
       this.dominoes.push(obj)
     }
     syncIdCounter(maxId)
-    this.onCountChange?.(this.dominoes.length)
-    return true
+    this.onCountChange(this.dominoes.length)
+    this.commit(prev)
+    this.fitCamera()
   }
 
-  export() {
-    const data = this.dominoes.map(d => d.data)
-    exportToFile(data)
+  getTemplates(): TemplateDef[] {
+    return TEMPLATES
   }
 
-  async importFile() {
-    const data = await importFromFile()
-    if (!data) return false
-    this.clearAll()
+  // ======== 保存 / 加载 ========
+  /** 导出当前全部骨牌数据 */
+  exportData(): DominoData[] {
+    return this.snapshot()
+  }
+
+  /** 用数据整体替换当前场景(加载/导入) */
+  replaceAll(data: DominoData[]) {
+    if (this.isPlaying) return false
+    const prev = this.snapshot()
+    for (const d of [...this.dominoes]) {
+      removeDomino(d, this.scene, this.world)
+    }
+    this.dominoes = []
+    this.setHover(null)
+    resetIdCounter()
     let maxId = 0
     for (const d of data) {
       if (d.id > maxId) maxId = d.id
-      const obj = buildDomino(this.scene, this.world, d)
+      const obj = buildDomino(this.scene, this.world, { ...d })
       this.dominoes.push(obj)
     }
     syncIdCounter(maxId)
-    this.onCountChange?.(this.dominoes.length)
+    this.onCountChange(this.dominoes.length)
+    this.commit(prev)
+    this.fitCamera()
     return true
   }
 
-  // ======== Animation Loop ========
+  // ======== 相机取景 ========
+  fitCamera() {
+    if (this.dominoes.length === 0) {
+      this.camera.position.set(9, 7, 10)
+      this.controls.target.set(0, 0.5, 0)
+      this.controls.update()
+      return
+    }
+    const box = new THREE.Box3()
+    for (const d of this.dominoes) {
+      box.expandByObject(d.mesh)
+    }
+    const center = box.getCenter(new THREE.Vector3())
+    const size = box.getSize(new THREE.Vector3())
+    const radius = Math.max(size.x, size.z, size.y / 2) / 2
+    // 按垂直视场角计算距离,让整体恰好入画(带 25% 留白)
+    const fov = this.camera.fov * Math.PI / 180
+    const dist = radius / Math.tan(fov / 2) * 1.25
+    const dir = new THREE.Vector3(0.6, 0.55, 0.9).normalize()
+    this.camera.position.copy(center).addScaledVector(dir, dist)
+    this.controls.target.copy(center)
+    this.controls.update()
+  }
+
+  // ======== 主循环 ========
   private startLoop() {
     const animate = () => {
       requestAnimationFrame(animate)
@@ -598,26 +895,41 @@ export class DominoScene {
     animate()
   }
 
-  // ======== Resize ========
-  private onResize(container: HTMLElement) {
-    const w = container.clientWidth
-    const h = container.clientHeight
+  /** 窗口尺寸变化 */
+  private onResizeHandler = () => {
+    if (!this.containerEl) return
+    const w = this.containerEl.clientWidth
+    const h = this.containerEl.clientHeight
     this.camera.aspect = w / h
     this.camera.updateProjectionMatrix()
     this.renderer.setSize(w, h)
   }
 
+  private containerEl: HTMLElement | null = null
+
   dispose() {
     this.renderer.dispose()
-    this.scene.traverse((obj) => {
-      if (obj instanceof THREE.Mesh) {
-        obj.geometry.dispose()
-        if (Array.isArray(obj.material)) {
-          obj.material.forEach(m => m.dispose())
-        } else {
-          obj.material.dispose()
-        }
-      }
-    })
+    this.controls.dispose()
+    window.removeEventListener('resize', this.onResizeHandler)
+    window.removeEventListener('keydown', this.onKeyDownHandler)
+    this.removeHoverHighlight()
+    if (this.ghost) {
+      this.scene.remove(this.ghost)
+      this.ghost.geometry.dispose()
+      ;(this.ghost.material as THREE.Material).dispose()
+    }
+    if (this.ghostMarker) {
+      this.scene.remove(this.ghostMarker)
+      this.ghostMarker.geometry.dispose()
+      ;(this.ghostMarker.material as THREE.Material).dispose()
+    }
+  }
+}
+
+/** 让 canvas 获得焦点以接收快捷键 */
+function canvasFocus(e: PointerEvent) {
+  const target = e.target as HTMLElement
+  if (target && typeof target.focus === 'function') {
+    try { target.focus({ preventScroll: true }) } catch { /* ignore */ }
   }
 }

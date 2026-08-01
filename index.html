@@ -3,55 +3,140 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="3D 多米诺骨牌搭建与推倒 — 摆出你的创意,一键推倒!" />
   <title>3D 多米诺骨牌</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🁎</text></svg>" />
 </head>
 <body>
   <div id="app">
     <div id="toolbar">
-      <div class="tool-group">
+      <div class="brand">
+        <span class="brand-mark">🁎</span>
+        <span class="brand-text">3D 多米诺</span>
+      </div>
+
+      <div class="tool-sep"></div>
+      <div class="tool-group" id="mode-group">
         <button class="tool-btn active" data-tool="place" title="放置模式 (1)">🖐 放置</button>
-        <button class="tool-btn" data-tool="delete" title="删除模式 (2)">🗑 删除</button>
-        <button class="tool-btn" data-tool="move" title="移动模式 (3)">✋ 移动</button>
+        <button class="tool-btn" data-tool="move" title="移动模式 (2)">✋ 移动</button>
+        <button class="tool-btn" data-tool="delete" title="删除模式 (3)">🗑 删除</button>
       </div>
-      <div class="tool-sep"></div>
-      <div class="tool-group color-group"></div>
+
       <div class="tool-sep"></div>
       <div class="tool-group">
-        <button id="btn-start" class="tool-btn primary" title="推倒！">▶ 推倒</button>
-        <button id="btn-reset-physics" class="tool-btn" title="复原">↺ 复原</button>
+        <button id="btn-play" class="tool-btn play" title="进入推倒模式">▶ 推倒</button>
+        <button id="btn-auto" class="tool-btn" title="一键推倒第一块">🚀</button>
+        <button id="btn-reset" class="tool-btn reset" title="复原 (Esc)" style="display:none">↺ 复原</button>
       </div>
+
       <div class="tool-sep"></div>
       <div class="tool-group">
-        <button id="btn-save" class="tool-btn" title="保存到本地">💾 保存</button>
-        <button id="btn-load" class="tool-btn" title="从本地加载">📂 加载</button>
-        <button id="btn-export" class="tool-btn" title="导出为文件">⬇ 导出</button>
-        <button id="btn-import" class="tool-btn" title="从文件导入">⬆ 导入</button>
+        <button id="btn-undo" class="tool-btn icon" title="撤销 (Ctrl+Z)" disabled>↩</button>
+        <button id="btn-redo" class="tool-btn icon" title="重做 (Ctrl+Shift+Z)" disabled>↪</button>
       </div>
+
       <div class="tool-sep"></div>
-      <div class="tool-group">
-        <button id="btn-settings" class="tool-btn settings-toggle" title="设置">⚙</button>
-        <div class="template-dropdown" id="template-dropdown">
-          <button id="btn-templates" class="tool-btn" title="自动排列模板">📐 模板</button>
-          <div class="template-menu" id="template-menu"></div>
+      <div class="dropdown" id="template-dropdown">
+        <button id="btn-templates" class="tool-btn" title="自动排列模板">📐 模板 <span class="caret">▾</span></button>
+        <div class="dropdown-menu" id="template-menu"></div>
+      </div>
+
+      <div class="tool-sep"></div>
+      <div class="dropdown" id="archive-dropdown">
+        <button id="btn-archive" class="tool-btn" title="存档与导入导出">💾 存档 <span class="caret">▾</span></button>
+        <div class="dropdown-menu" id="archive-menu">
+          <button class="dropdown-item" id="act-save">💾 保存到浏览器</button>
+          <button class="dropdown-item" id="act-load">📂 读取存档</button>
+          <div class="dropdown-sep"></div>
+          <button class="dropdown-item" id="act-export">⬇ 导出为文件</button>
+          <button class="dropdown-item" id="act-import">⬆ 从文件导入</button>
         </div>
-        <button id="btn-clear" class="tool-btn danger" title="清空所有">✕ 清空</button>
       </div>
+
+      <div class="tool-sep"></div>
+      <div class="tool-group">
+        <button id="btn-clear" class="tool-btn danger" title="清空所有骨牌">🗑 清空</button>
+        <button id="btn-help" class="tool-btn icon" title="帮助">?</button>
+        <button id="btn-settings" class="tool-btn icon" title="设置">⚙</button>
+      </div>
+
       <div class="tool-spacer"></div>
-      <div class="tool-info">
-        <span id="domino-count">🁎 0</span>
-        <span id="mode-label">放置模式</span>
-      </div>
+      <div class="tool-info"><span id="domino-count">🁎 0</span></div>
     </div>
 
+    <div id="color-panel" title="选择骨牌颜色"></div>
+
     <div id="settings-panel">
-      <div class="settings-header">⚙ 参数设置</div>
-      <div class="settings-body"></div>
+      <div class="panel-header">⚙ 设置</div>
+      <div class="panel-body">
+        <div class="setting-group">
+          <div class="setting-group-title">骨牌尺寸</div>
+          <div class="seg" id="setting-size"></div>
+        </div>
+        <div class="setting-group">
+          <div class="setting-group-title">摆放间距</div>
+          <div class="seg" id="setting-gap"></div>
+        </div>
+        <div class="setting-group">
+          <div class="setting-row-toggle">
+            <span>网格对齐</span>
+            <button class="switch" id="toggle-snap" title="放置/移动时吸附到网格"></button>
+          </div>
+          <div class="setting-row-toggle">
+            <span>音效</span>
+            <button class="switch" id="toggle-sound" title="放置与碰撞音效"></button>
+          </div>
+        </div>
+        <div class="setting-group">
+          <button class="advanced-toggle" id="advanced-toggle">物理参数(高级) ▾</button>
+          <div class="advanced-body" id="advanced-body"></div>
+        </div>
+      </div>
     </div>
 
     <div id="canvas-container"></div>
-    <div id="status-bar">
-      <span>左键放骨牌 · 中键旋转 · 右键缩放 · Shift画线 · R键方向 · ⚙调参数 · 推倒模式点击骨牌</span>
+    <div id="status-bar"></div>
+
+    <div id="help-overlay">
+      <div class="help-card">
+        <div class="help-header">🁎 欢迎来到 3D 多米诺</div>
+        <div class="help-grid">
+          <div class="help-item">
+            <div class="help-icon">🖐</div>
+            <b>放置</b>
+            <span>左键单击放一块,按住左键拖动画出一长排</span>
+          </div>
+          <div class="help-item">
+            <div class="help-icon">✋</div>
+            <b>移动</b>
+            <span>按住骨牌拖到新位置,支持网格对齐</span>
+          </div>
+          <div class="help-item">
+            <div class="help-icon">🗑</div>
+            <b>删除</b>
+            <span>单击删除,按住拖动连续清除</span>
+          </div>
+          <div class="help-item">
+            <div class="help-icon">🖱</div>
+            <b>视角</b>
+            <span>右键拖动旋转 · 滚轮缩放 · 中键平移</span>
+          </div>
+          <div class="help-item">
+            <div class="help-icon">▶</div>
+            <b>推倒</b>
+            <span>点击骨牌开始连锁,或 🚀 一键推倒</span>
+          </div>
+          <div class="help-item">
+            <div class="help-icon">↩</div>
+            <b>撤销</b>
+            <span>Ctrl+Z 撤销 · Ctrl+Shift+Z 重做</span>
+          </div>
+        </div>
+        <div class="help-footer">
+          <span class="help-tip">💡 按 R 旋转放置方向 · 摆放自动保存到浏览器</span>
+          <button id="help-close" class="primary-btn">开始搭建</button>
+        </div>
+      </div>
     </div>
   </div>
   <script type="module" src="/src/main.ts"></script>

@@ -1,5 +1,5 @@
-import { DominoData, dominoW, generateId } from './domino'
-import { COLOR_PRESETS } from './config'
+import { DominoData, generateId, dominoW } from './domino'
+import { COLOR_PRESETS, dominoGap } from './config'
 
 export interface TemplateDef {
   name: string
@@ -7,196 +7,208 @@ export interface TemplateDef {
   generate: () => DominoData[]
 }
 
-// ======== Helpers ========
+// ======== 辅助 ========
 
-function colorArray(): number[] {
-  return COLOR_PRESETS.map(c => c.value)
-}
+interface PathPoint { x: number; z: number }
 
 function nextId(): number {
   return generateId()
 }
 
-const W = () => dominoW()
-
-// ======== Spiral ========
-function generateSpiral(): DominoData[] {
-  const result: DominoData[] = []
-  const spacing = W() + 0.02
-  const turns = 4
-  const total = 80
-  const color = colorArray()
-
-  for (let i = 0; i < total; i++) {
-    const t = (i / total) * turns * Math.PI * 2
-    const radius = 0.3 + (i / total) * 3.5
-    const x = Math.cos(t) * radius
-    const z = Math.sin(t) * radius
-    const rotation = -t + Math.PI / 2
-
-    result.push({
-      id: nextId(),
-      x: Math.round(x * 100) / 100,
-      z: Math.round(z * 100) / 100,
-      rotation,
-      color: color[i % color.length],
-    })
-  }
-  return result
+function round2(v: number): number {
+  return Math.round(v * 100) / 100
 }
 
-// ======== Snake ========
-function generateSnake(): DominoData[] {
-  const result: DominoData[] = []
-  const spacing = W() + 0.02
-  const segmentLen = 8
-  const rows = 4
-  const color = colorArray()
-  let idx = 0
-
-  for (let row = 0; row < rows; row++) {
-    const z = row * spacing * 2 - (rows - 1) * spacing
-    const isRight = row % 2 === 0
-    for (let i = 0; i < segmentLen; i++) {
-      const x = isRight ? i * spacing : (segmentLen - 1 - i) * spacing
-      const adjustedX = x - (segmentLen - 1) * spacing / 2
-      result.push({
+/**
+ * 沿折线路径放置骨牌。
+ * 每块骨牌的"前方"(局部 +z)指向路径前进方向 → 推倒后可沿路径连锁。
+ */
+function placeAlongPath(
+  points: PathPoint[],
+  spacing: number,
+  colorFn: (i: number) => number,
+  out: DominoData[],
+) {
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i]
+    const b = points[i + 1]
+    const dx = b.x - a.x
+    const dz = b.z - a.z
+    const len = Math.hypot(dx, dz)
+    if (len < 1e-6) continue
+    const n = Math.max(1, Math.round(len / spacing))
+    const rotation = Math.atan2(dx, dz)
+    for (let j = 0; j < n; j++) {
+      const t = j / n
+      out.push({
         id: nextId(),
-        x: Math.round(adjustedX * 100) / 100,
-        z: Math.round(z * 100) / 100,
-        rotation: 0,
-        color: color[idx % color.length],
+        x: round2(a.x + dx * t),
+        z: round2(a.z + dz * t),
+        rotation,
+        color: colorFn(out.length),
       })
-      idx++
     }
   }
-  return result
 }
 
-// ======== Pyramid ========
-function generatePyramid(): DominoData[] {
-  const result: DominoData[] = []
-  const spacing = W() + 0.02
-  const rows = 10
-  const color = colorArray()
-  let idx = 0
+function colorArray(): number[] {
+  return COLOR_PRESETS.map(c => c.value)
+}
 
+function rainbow(i: number): number {
+  const colors = colorArray()
+  return colors[i % colors.length]
+}
+
+function spacing(): number {
+  return dominoW() + dominoGap()
+}
+
+// ======== 螺旋 ========
+function generateSpiral(): DominoData[] {
+  const out: DominoData[] = []
+  const pts: PathPoint[] = []
+  const total = 100
+  const turns = 4
+  for (let i = 0; i <= total; i++) {
+    const t = (i / total) * turns * Math.PI * 2
+    const radius = 0.3 + (i / total) * 3.6
+    pts.push({ x: Math.cos(t) * radius, z: Math.sin(t) * radius })
+  }
+  placeAlongPath(pts, spacing(), rainbow, out)
+  return out
+}
+
+// ======== 蛇形(S 型折线,连续路径)======
+function generateSnake(): DominoData[] {
+  const out: DominoData[] = []
+  const s = spacing()
+  const cols = 6
+  const rows = 4
+  const pts: PathPoint[] = []
+  const startX = -((cols - 1) / 2) * s
+  for (let row = 0; row < rows; row++) {
+    const z = row * s * 1.2
+    if (row % 2 === 0) {
+      for (let c = 0; c < cols; c++) pts.push({ x: startX + c * s, z })
+    } else {
+      for (let c = cols - 1; c >= 0; c--) pts.push({ x: startX + c * s, z })
+    }
+  }
+  placeAlongPath(pts, s, rainbow, out)
+  return out
+}
+
+// ======== 三角墙(金字塔)======
+function generatePyramid(): DominoData[] {
+  const out: DominoData[] = []
+  const s = spacing()
+  const rows = 10
   for (let row = 0; row < rows; row++) {
     const count = rows - row
-    const zOffset = row * spacing * 0.6
+    const z = row * s * 0.65
     for (let i = 0; i < count; i++) {
-      const x = (i - (count - 1) / 2) * spacing
-      const z = zOffset
-      result.push({
+      const x = (i - (count - 1) / 2) * s
+      out.push({
         id: nextId(),
-        x: Math.round(x * 100) / 100,
-        z: Math.round(z * 100) / 100,
-        rotation: 0,
-        color: color[idx % color.length],
+        x: round2(x),
+        z: round2(z),
+        rotation: Math.PI / 2, // 前方朝 +x,行内从左到右连锁
+        color: rainbow(out.length),
       })
-      idx++
     }
   }
-  return result
+  return out
 }
 
-// ======== Heart ========
+// ======== 心形 ========
 function generateHeart(): DominoData[] {
-  const result: DominoData[] = []
-  const color = colorArray()
-  const total = 60
-  const scale = 0.2
-  let idx = 0
-
-  for (let i = 0; i < total; i++) {
+  const out: DominoData[] = []
+  const pts: PathPoint[] = []
+  const total = 120
+  const scale = 0.22
+  for (let i = 0; i <= total; i++) {
     const t = (i / total) * Math.PI * 2
     const sinT = Math.sin(t)
     const x = 16 * sinT * sinT * sinT * scale
     const z = (13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t)) * scale
-
-    const dt = 0.01
-    const t2 = t + dt
-    const sinT2 = Math.sin(t2)
-    const x2 = 16 * sinT2 * sinT2 * sinT2 * scale
-    const z2 = (13 * Math.cos(t2) - 5 * Math.cos(2 * t2) - 2 * Math.cos(3 * t2) - Math.cos(4 * t2)) * scale
-    const rotation = Math.atan2(z2 - z, x2 - x) - Math.PI / 2
-
-    result.push({
-      id: nextId(),
-      x: Math.round(x * 100) / 100,
-      z: Math.round(z * 100) / 100,
-      rotation,
-      color: color[idx % color.length],
-    })
-    idx++
+    pts.push({ x, z })
   }
-  return result
+  placeAlongPath(pts, spacing(), rainbow, out)
+  return out
 }
 
-// ======== Concentric Circles ========
+// ======== 同心圆 ========
 function generateCircles(): DominoData[] {
-  const result: DominoData[] = []
-  const spacing = W() + 0.06
+  const out: DominoData[] = []
+  const s = spacing()
   const rings = 4
-  const color = colorArray()
-  let idx = 0
-
   for (let ring = 1; ring <= rings; ring++) {
-    const radius = ring * spacing * 1.3
+    const radius = ring * s * 1.25
     const circumference = 2 * Math.PI * radius
-    const count = Math.max(8, Math.floor(circumference / spacing))
-    for (let i = 0; i < count; i++) {
+    const count = Math.max(10, Math.floor(circumference / s))
+    const pts: PathPoint[] = []
+    for (let i = 0; i <= count; i++) {
       const angle = (i / count) * Math.PI * 2
-      const x = Math.cos(angle) * radius
-      const z = Math.sin(angle) * radius
-      const rotation = angle + Math.PI / 2
+      pts.push({ x: Math.cos(angle) * radius, z: Math.sin(angle) * radius })
+    }
+    placeAlongPath(pts, s, rainbow, out)
+  }
+  return out
+}
 
-      result.push({
-        id: nextId(),
-        x: Math.round(x * 100) / 100,
-        z: Math.round(z * 100) / 100,
-        rotation,
-        color: color[idx % color.length],
-      })
-      idx++
+// ======== 回字(方形螺旋,连续路径)======
+function generateSquare(): DominoData[] {
+  const out: DominoData[] = []
+  const s = spacing()
+  const pts: PathPoint[] = []
+  const loops = 4
+  let x = 0
+  let z = 0
+  const dirs = [
+    { x: 0, z: -1 }, { x: 1, z: 0 }, { x: 0, z: 1 }, { x: -1, z: 0 },
+  ]
+  let d = 0
+  let len = 2
+  for (let l = 0; l < loops; l++) {
+    for (let e = 0; e < 4; e++) {
+      const dir = dirs[d]
+      for (let i = 0; i < len; i++) {
+        x += dir.x * s
+        z += dir.z * s
+        pts.push({ x, z })
+      }
+      d = (d + 1) % 4
+      if (e % 2 === 1) len += 2
     }
   }
-  return result
+  placeAlongPath(pts, s, rainbow, out)
+  return out
 }
 
-// ======== Cross / X Pattern ========
+// ======== 交叉(X 形)======
 function generateCross(): DominoData[] {
-  const result: DominoData[] = []
-  const color = colorArray()
-  const spacing = W() + 0.02
-  const armLen = 7
-
-  for (let i = 0; i < armLen * 2 + 1; i++) {
-    const offset = (i - armLen) * spacing
-    result.push({
-      id: nextId(),
-      x: Math.round(offset * 100) / 100,
-      z: Math.round(offset * 100) / 100,
-      rotation: i % 2 === 0 ? Math.PI / 4 : Math.PI / 2,
-      color: color[i % color.length],
-    })
-    result.push({
-      id: nextId(),
-      x: Math.round(offset * 100) / 100,
-      z: Math.round(-offset * 100) / 100,
-      rotation: i % 2 === 0 ? Math.PI / 4 : 0,
-      color: color[(i + 1) % color.length],
-    })
-  }
-  return result
+  const out: DominoData[] = []
+  const s = spacing()
+  const arm = 7
+  // 主对角线
+  const diag1: PathPoint[] = []
+  for (let i = -arm; i <= arm; i++) diag1.push({ x: i * s, z: i * s })
+  placeAlongPath(diag1, s, rainbow, out)
+  // 副对角线
+  const diag2: PathPoint[] = []
+  for (let i = -arm; i <= arm; i++) diag2.push({ x: i * s, z: -i * s })
+  placeAlongPath(diag2, s, rainbow, out)
+  return out
 }
 
-// ======== Template Registry ========
+// ======== 模板注册 ========
 export const TEMPLATES: TemplateDef[] = [
   { name: '螺旋', icon: '🌀', generate: generateSpiral },
   { name: '蛇形', icon: '🐍', generate: generateSnake },
   { name: '三角墙', icon: '🔺', generate: generatePyramid },
   { name: '心形', icon: '❤️', generate: generateHeart },
   { name: '同心圆', icon: '⭕', generate: generateCircles },
+  { name: '回字', icon: '◻️', generate: generateSquare },
   { name: '交叉', icon: '✖️', generate: generateCross },
 ]
