@@ -81,6 +81,8 @@ export function buildDomino(
 
   const mesh = createDominoMesh(data.color, data.w, data.h, data.d)
   const body = createBody(data.w, data.h, data.d)
+  // 关联数据(碰撞助推等逻辑需要读取骨牌尺寸)
+  ;(body as any).__dominoData = data
 
   const h2 = data.h / 2
   body.position.set(data.x, h2, data.z)

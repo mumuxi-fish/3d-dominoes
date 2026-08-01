@@ -237,7 +237,14 @@ export class DominoScene {
   }
 
   // ======== 射线工具 ========
+  /** 确保相机世界矩阵与逆矩阵最新(相机被直接改位置后,matrixWorldInverse 要等渲染帧才更新) */
+  private ensureCameraMatrix() {
+    this.camera.updateMatrixWorld()
+    this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert()
+  }
+
   private groundHit(clientX: number, clientY: number): THREE.Vector3 | null {
+    this.ensureCameraMatrix()
     this.mouse.x = (clientX / this.renderer.domElement.clientWidth) * 2 - 1
     this.mouse.y = -(clientY / this.renderer.domElement.clientHeight) * 2 + 1
     this.raycaster.setFromCamera(this.mouse, this.camera)
@@ -253,6 +260,7 @@ export class DominoScene {
   }
 
   private dominoHit(clientX: number, clientY: number): DominoObject | null {
+    this.ensureCameraMatrix()
     this.mouse.x = (clientX / this.renderer.domElement.clientWidth) * 2 - 1
     this.mouse.y = -(clientY / this.renderer.domElement.clientHeight) * 2 + 1
     this.raycaster.setFromCamera(this.mouse, this.camera)
@@ -518,19 +526,42 @@ export class DominoScene {
       this.toppleTriggered = true
     }
     // 朝骨牌前方推倒,连锁沿前方传导
+    ;(domino.body as any).__falling = true
     toppleDominoAt(domino, facingVector(domino.data.rotation))
     this.setHover(null)
   }
 
   private setupCollisionSound(body: CANNON.Body) {
+    // 幂等:同一刚体只注册一次(每轮播放都会调用,匿名函数引用去重无效)
+    if ((body as any).__soundSetup) return
+    ;(body as any).__soundSetup = true
     body.addEventListener(CANNON.Body.COLLIDE_EVENT_NAME, (event: any) => {
       if (body.type !== CANNON.Body.DYNAMIC) return
       try {
         const contact = event.contact
-        const v = contact.getImpactVelocityAlongNormal()
-        if (Math.abs(v) > 0.4) {
-          playImpact(Math.min(1, Math.abs(v) / 8))
+        const impactVel = contact.getImpactVelocityAlongNormal()
+        if (Math.abs(impactVel) > 0.4) {
+          playImpact(Math.min(1, Math.abs(impactVel) / 8))
         }
+        // 碰撞助推:cannon 的接触求解会让倒下骨牌与下一块"粘滞锁死",
+        // 连锁能量被整条锁链均摊而衰减(约 3-4 块即断)。
+        // 检测到骨牌间撞击时,标记被撞骨牌为"倒下中",主循环会
+        // 持续给它注入绕底边的角速度,直到它躺平,连锁因此稳定传播。
+        const a: CANNON.Body = contact.bi
+        const b: CANNON.Body = contact.bj
+        if (!a || !b || a.type !== CANNON.Body.DYNAMIC || b.type !== CANNON.Body.DYNAMIC) return
+        // 撞击门槛:轻微接触(堆叠/抖动)不触发
+        if (Math.abs(impactVel) < 0.3) return
+        // 被撞者 = 更竖直的一方(位置更高)
+        const target = a.position.y >= b.position.y ? a : b
+        if (!(target as any).__dominoData) return
+        // 只标记还没倒下的骨牌
+        if (target.position.y < 0.45) return
+        // 节流:同一目标 100ms 内只触发一次
+        const now = performance.now()
+        if (now - ((target as any).__lastBoost ?? 0) < 100) return
+        ;(target as any).__lastBoost = now
+        ;(target as any).__falling = true
       } catch {
         /* ignore */
       }
@@ -553,6 +584,7 @@ export class DominoScene {
       this.setupCollisionSound(d.body)
     }
     this.toppleTriggered = true
+    ;(first.body as any).__falling = true
     toppleDominoAt(first, facingVector(first.data.rotation))
   }
 
@@ -883,8 +915,39 @@ export class DominoScene {
       this.controls.update()
 
       if (this.isPlaying) {
-        this.world.step(1 / 60, dt, 3)
+        // 物理按真实时间推进:子步数 = 需要追赶的物理步数(低帧率时也不超速/不慢动作)
+        const substeps = Math.max(1, Math.min(20, Math.ceil(dt * 60)))
+        this.world.step(1 / 60, Math.min(dt, 0.5), substeps)
+        // 倒下传播兜底:碰撞事件偶发丢失时,已倒下骨牌前方近距离的
+        // 竖直骨牌也会被标记倒下(模拟撞击传导),保证连锁不中断。
         for (const d of this.dominoes) {
+          const body = d.body as any
+          // 躺平后停止参与传播(避免连锁结束后每帧 O(n²) 空转)
+          if (!body.__falling || body.position.y < 0.5) continue
+          const fwd = facingVector(d.data.rotation)
+          for (const o of this.dominoes) {
+            if (o === d) continue
+            const ob = o.body as any
+            if (ob.__falling || ob.position.y < 0.5) continue
+            const dx = ob.position.x - body.position.x
+            const dz = ob.position.z - body.position.z
+            const proj = dx * fwd.x + dz * fwd.z
+            if (proj < 0.3 || proj > 1.6) continue
+            const perp = Math.abs(dx * fwd.z - dz * fwd.x)
+            if (perp < 0.55) ob.__falling = true
+          }
+        }
+        for (const d of this.dominoes) {
+          // 连锁持续注入:被撞倒的骨牌绕底边朝前方倒下,直到躺平。
+          // cannon 的接触求解会把接触骨牌刚性锁死,单次冲量无法传播,
+          // 这里每帧强制注入角速度,让连锁稳定传导。
+          const body = d.body as any
+          if (body.__falling && body.position.y > 0.55) {
+            const fwd = facingVector(d.data.rotation)
+            const axis = new CANNON.Vec3(fwd.z, 0, -fwd.x)
+            body.angularVelocity.set(axis.x * 1.8, 0, axis.z * 1.8)
+            body.wakeUp()
+          }
           d.mesh.position.copy(d.body.position as unknown as THREE.Vector3)
           d.mesh.quaternion.copy(d.body.quaternion as unknown as THREE.Quaternion)
         }

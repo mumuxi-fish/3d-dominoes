@@ -7,14 +7,20 @@ export function createPhysicsWorld(): CANNON.World {
   const world = new CANNON.World()
   world.gravity.set(0, -9.82, 0)
   world.broadphase = new CANNON.SAPBroadphase(world)
-  world.allowSleep = true
-  ;(world.solver as any).iterations = 12
+  // 多米诺倒下依赖持续重力矩,骨牌短暂低速时入睡会冻结连锁,禁用睡眠
+  world.allowSleep = false
+  ;(world.solver as any).iterations = 30
+  ;(world.solver as any).tolerance = 1e-6
 
   const defaultMat = new CANNON.Material('default')
   const dominoMat = new CANNON.Material('domino')
+  // 接触刚度调低:刚性接触(默认 1e7)会让倒下的骨牌与下一块"粘滞锁死",
+  // 连锁能量被整条锁链均摊而衰减。软接触允许骨牌碰撞后分离,连锁才能传播。
+  const soft = { stiffness: 2e5, relaxation: 4 }
   const contactMat = new CANNON.ContactMaterial(defaultMat, defaultMat, {
     friction: config.friction,
     restitution: config.restitution,
+    ...soft,
   })
   world.addContactMaterial(contactMat)
 
@@ -22,6 +28,7 @@ export function createPhysicsWorld(): CANNON.World {
   const dominoContact = new CANNON.ContactMaterial(dominoMat, dominoMat, {
     friction: config.friction,
     restitution: config.restitution * 0.8,
+    ...soft,
   })
   world.addContactMaterial(dominoContact)
   const groundContact = new CANNON.ContactMaterial(dominoMat, defaultMat, {

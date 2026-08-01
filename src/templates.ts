@@ -20,8 +20,61 @@ function round2(v: number): number {
 }
 
 /**
+ * 折线拐角圆角化:在转角处插入圆弧过渡点。
+ * 直角/锐角折线无法连锁(倒下骨牌沿前方,够不到垂直方向的下一块),
+ * 圆弧过渡让骨牌方向渐变、间距加密,连锁能沿弯道传导。
+ */
+function smoothCorners(points: PathPoint[], R: number): PathPoint[] {
+  if (points.length < 3) return points
+  const out: PathPoint[] = [points[0]]
+  for (let i = 1; i < points.length - 1; i++) {
+    const prev = points[i - 1]
+    const cur = points[i]
+    const next = points[i + 1]
+    const d1x = cur.x - prev.x
+    const d1z = cur.z - prev.z
+    const d2x = next.x - cur.x
+    const d2z = next.z - cur.z
+    const l1 = Math.hypot(d1x, d1z)
+    const l2 = Math.hypot(d2x, d2z)
+    if (l1 < 1e-6 || l2 < 1e-6) { out.push(cur); continue }
+    const u1x = d1x / l1, u1z = d1z / l1
+    const u2x = d2x / l2, u2z = d2z / l2
+    const cosT = Math.max(-1, Math.min(1, u1x * u2x + u1z * u2z))
+    const theta = Math.acos(cosT)
+    // 只处理明显拐角(折线);平滑曲线(逐点小转角)保持原样
+    if (theta < 0.6) { out.push(cur); continue }
+
+    const r = Math.min(R, l1 * 0.5, l2 * 0.5)
+    const cross = u1x * u2z - u1z * u2x
+    // 角内侧单位法向(左转取 d1 逆时针 90°,右转取顺时针 90°)
+    const nx = cross > 0 ? -u1z : u1z
+    const nz = cross > 0 ? u1x : -u1x
+    const ax = cur.x - u1x * r
+    const az = cur.z - u1z * r
+    const ox = ax + nx * r
+    const oz = az + nz * r
+    const a1 = Math.atan2(az - oz, ax - ox)
+    const bx = cur.x + u2x * r
+    const bz = cur.z + u2z * r
+    let a2 = Math.atan2(bz - oz, bx - ox)
+    // 统一旋转方向:左转(逆时针)时 a2 > a1,右转时 a2 < a1
+    if (cross > 0 && a2 < a1) a2 += Math.PI * 2
+    if (cross < 0 && a2 > a1) a2 -= Math.PI * 2
+    const m = Math.max(3, Math.ceil(Math.abs(a2 - a1) / 0.4))
+    for (let j = 1; j <= m; j++) {
+      const a = a1 + (a2 - a1) * (j / m)
+      out.push({ x: ox + Math.cos(a) * r, z: oz + Math.sin(a) * r })
+    }
+  }
+  out.push(points[points.length - 1])
+  return out
+}
+
+/**
  * 沿折线路径放置骨牌。
  * 每块骨牌的"前方"(局部 +z)指向路径前进方向 → 推倒后可沿路径连锁。
+ * 拐角处自动圆弧过渡,保证弯道也能连锁。
  */
 function placeAlongPath(
   points: PathPoint[],
@@ -29,9 +82,10 @@ function placeAlongPath(
   colorFn: (i: number) => number,
   out: DominoData[],
 ) {
-  for (let i = 0; i < points.length - 1; i++) {
-    const a = points[i]
-    const b = points[i + 1]
+  const smooth = smoothCorners(points, spacing * 0.9)
+  for (let i = 0; i < smooth.length - 1; i++) {
+    const a = smooth[i]
+    const b = smooth[i + 1]
     const dx = b.x - a.x
     const dz = b.z - a.z
     const len = Math.hypot(dx, dz)
