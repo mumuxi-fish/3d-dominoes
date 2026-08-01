@@ -16,7 +16,7 @@ export function createPhysicsWorld(): CANNON.World {
   const dominoMat = new CANNON.Material('domino')
   // 接触刚度调低:刚性接触(默认 1e7)会让倒下的骨牌与下一块"粘滞锁死",
   // 连锁能量被整条锁链均摊而衰减。软接触允许骨牌碰撞后分离,连锁才能传播。
-  const soft = { stiffness: 2e5, relaxation: 4 }
+  const soft = { stiffness: 8e3, relaxation: 4 }
   const contactMat = new CANNON.ContactMaterial(defaultMat, defaultMat, {
     friction: config.friction,
     restitution: config.restitution,
@@ -57,18 +57,15 @@ export function activatePhysics(dominoes: DominoObject[]) {
 }
 
 /**
- * 推倒某块骨牌:在重心高处施加冲量
- * @param direction 世界空间推倒方向(归一化),骨牌将朝此方向倒下
+ * 推倒某块骨牌:只注入绕底边的倒下角速度。
+ * 注意:不能用 applyImpulse —— 它会同时给骨牌线速度,导致骨牌
+ * "平移"滑向下一块、在还没倒下时就被推着提前接触,破坏传递感。
+ * @param direction 世界空间倒下方向(归一化,骨牌前方)
  */
 export function toppleDominoAt(target: DominoObject, direction: CANNON.Vec3) {
-  const h = dominoH(target.data)
-  const dir = direction.clone().scale(config.impulseStrength)
-  const wp = new CANNON.Vec3(
-    target.body.position.x,
-    h * 0.8,
-    target.body.position.z,
-  )
-  target.body.applyImpulse(dir, wp)
+  const axis = new CANNON.Vec3(direction.z, 0, -direction.x)
+  target.body.angularVelocity.set(axis.x * 2.5, 0, axis.z * 2.5)
+  target.body.wakeUp()
 }
 
 /** 复原:重建所有刚体,回到编辑态 */

@@ -458,12 +458,12 @@ export class DominoScene {
       const stepDist = Math.sqrt(ddx * ddx + ddz * ddz)
       if (stepDist < spacing) break
       const angle = Math.atan2(ddx, ddz)
-      g.lastPlaced = new THREE.Vector3(
-        lx + (ddx / stepDist) * spacing,
-        0,
-        lz + (ddz / stepDist) * spacing,
-      )
-      this.placeDominoAt(g.lastPlaced.x, g.lastPlaced.z, angle)
+      const nx = Math.max(-BOUNDARY, Math.min(BOUNDARY, lx + (ddx / stepDist) * spacing))
+      const nz = Math.max(-BOUNDARY, Math.min(BOUNDARY, lz + (ddz / stepDist) * spacing))
+      // 卡在场景边界(clamp 后原地不动):停止铺排,避免骨牌重叠堆叠
+      if (nx === lx && nz === lz) break
+      g.lastPlaced = new THREE.Vector3(nx, 0, nz)
+      this.placeDominoAt(nx, nz, angle)
       playPlace()
       guard++
     }
@@ -555,13 +555,21 @@ export class DominoScene {
         // 被撞者 = 更竖直的一方(位置更高)
         const target = a.position.y >= b.position.y ? a : b
         if (!(target as any).__dominoData) return
-        // 只标记还没倒下的骨牌
-        if (target.position.y < 0.45) return
+        // 只标记还没躺平的骨牌(被压着的也需要继续倒下)
+        if (target.position.y < 0.3) return
         // 节流:同一目标 100ms 内只触发一次
         const now = performance.now()
         if (now - ((target as any).__lastBoost ?? 0) < 100) return
         ;(target as any).__lastBoost = now
         ;(target as any).__falling = true
+        // 立即给被撞骨牌初始倒下角速度(沿自身前方轴),让传递干脆不拖沓
+        const tData = (target as any).__dominoData
+        if (tData) {
+          const f2 = facingVector(tData.rotation)
+          const a2 = new CANNON.Vec3(f2.z, 0, -f2.x)
+          target.angularVelocity.set(a2.x * 2.5, 0, a2.z * 2.5)
+          target.wakeUp()
+        }
       } catch {
         /* ignore */
       }
@@ -585,6 +593,13 @@ export class DominoScene {
     }
     this.toppleTriggered = true
     ;(first.body as any).__falling = true
+    // 源头直接给倒下角速度(沿自身前方轴),确保第一块干脆倒下
+    {
+      const f = facingVector(first.data.rotation)
+      const ax = new CANNON.Vec3(f.z, 0, -f.x)
+      first.body.angularVelocity.set(ax.x * 2.5, 0, ax.z * 2.5)
+      first.body.wakeUp()
+    }
     toppleDominoAt(first, facingVector(first.data.rotation))
   }
 
@@ -918,12 +933,14 @@ export class DominoScene {
         // 物理按真实时间推进:子步数 = 需要追赶的物理步数(低帧率时也不超速/不慢动作)
         const substeps = Math.max(1, Math.min(20, Math.ceil(dt * 60)))
         this.world.step(1 / 60, Math.min(dt, 0.5), substeps)
-        // 倒下传播兜底:碰撞事件偶发丢失时,已倒下骨牌前方近距离的
-        // 竖直骨牌也会被标记倒下(模拟撞击传导),保证连锁不中断。
+        // 倒下传递:骨牌倾斜到"顶端足以碰到下一块"时,前方竖直骨牌才会被传染。
+        // 传递窗口取倾角 ~32°-51°(中心 y 0.68→0.5),保证碰撞事件偶发丢失时链条不断,
+        // 但不会在刚被推倒时就提前传染 —— 连锁必须是"碰到才倒"的传递。
         for (const d of this.dominoes) {
           const body = d.body as any
-          // 躺平后停止参与传播(避免连锁结束后每帧 O(n²) 空转)
-          if (!body.__falling || body.position.y < 0.5) continue
+          if (!body.__falling) continue
+          if (body.position.y < 0.42) continue   // 已躺平,停止参与
+          if (body.position.y > 0.70) continue  // 还没倒够,顶端尚未触及下一块
           const fwd = facingVector(d.data.rotation)
           for (const o of this.dominoes) {
             if (o === d) continue
@@ -932,20 +949,57 @@ export class DominoScene {
             const dx = ob.position.x - body.position.x
             const dz = ob.position.z - body.position.z
             const proj = dx * fwd.x + dz * fwd.z
-            if (proj < 0.3 || proj > 1.6) continue
+            if (proj < 0.05 || proj > 1.6) continue
             const perp = Math.abs(dx * fwd.z - dz * fwd.x)
             if (perp < 0.55) ob.__falling = true
           }
         }
         for (const d of this.dominoes) {
-          // 连锁持续注入:被撞倒的骨牌绕底边朝前方倒下,直到躺平。
-          // cannon 的接触求解会把接触骨牌刚性锁死,单次冲量无法传播,
-          // 这里每帧强制注入角速度,让连锁稳定传导。
+          // 脚本化倒下:被撞倒的骨牌每帧绕底边旋转 quaternion。
+          // cannon 的接触求解会对"站立盒子绕底边旋转"施加过度约束
+          // (底面角压入地面被强力阻止),角速度注入会被抵消;直接旋转
+          // quaternion 绕过阻碍,倒下必然发生。角速度同步给 cannon,
+          // 保证碰撞推下一块时接触响应正确。倒下超过 ~65% 后交给
+          // 物理惯性完成,避免过冲翻转。
           const body = d.body as any
-          if (body.__falling && body.position.y > 0.55) {
+          if (body.__falling && body.position.y > 0.3) {
             const fwd = facingVector(d.data.rotation)
             const axis = new CANNON.Vec3(fwd.z, 0, -fwd.x)
-            body.angularVelocity.set(axis.x * 1.8, 0, axis.z * 1.8)
+            const omega = 1.1
+            const step = Math.min(dt, 0.04)
+            const half = omega * step * 0.5
+            const qw = Math.cos(half)
+            const qx = axis.x * Math.sin(half)
+            const qy = axis.y * Math.sin(half)
+            const qz = axis.z * Math.sin(half)
+            const q = body.quaternion
+            // 世界左乘:q_new = axisQuat ⊗ q(绕世界轴旋转)
+            const nx = qw * q.x + qx * q.w + qy * q.z - qz * q.y
+            const ny = qw * q.y - qx * q.z + qy * q.w + qz * q.x
+            const nz = qw * q.z + qx * q.y - qy * q.x + qz * q.w
+            const nw = qw * q.w - qx * q.x - qy * q.y - qz * q.z
+            q.set(nx, ny, nz, nw)
+            q.normalize()
+            // 贴地滚动:绕底边前角旋转,质心沿倒下方向同步平移
+            // (绕质心旋转会让底边前滑/穿透,水平平移补上滚动的位移)
+            const tData = (d as any).data
+            const hh = (tData.h ?? 1.6) / 2
+            const dd = (tData.d ?? 0.24) / 2
+            const ly = {
+              x: 2 * (q.x * q.y - q.w * q.z),
+              y: 1 - 2 * (q.x * q.x + q.z * q.z),
+              z: 2 * (q.y * q.z + q.w * q.x),
+            }
+            const ang = Math.acos(Math.max(-1, Math.min(1, ly.y)))
+            const prevAng = (body as any).__lastAng ?? 0
+            const delta = hh * (Math.sin(ang) - Math.sin(prevAng))
+            body.position.x += fwd.x * delta
+            body.position.z += fwd.z * delta
+            body.position.y = hh * Math.cos(ang) + dd * Math.sin(ang)
+            ;(body as any).__lastAng = ang
+            // 角速度同步给 cannon(cannon 积分会叠加旋转,omega 已按半量设计;
+            // 角速度同时让碰撞/接触检测保持正常,纯脚本旋转会导致 collide 丢失)
+            body.angularVelocity.set(axis.x * omega, 0, axis.z * omega)
             body.wakeUp()
           }
           d.mesh.position.copy(d.body.position as unknown as THREE.Vector3)
