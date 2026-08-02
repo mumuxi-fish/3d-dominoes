@@ -82,7 +82,9 @@ export function resetPhysics(dominoes: DominoObject[], world: CANNON.World) {
     world.addBody(newBody)
 
     d.mesh.position.set(d.data.x, h / 2, d.data.z)
-    d.mesh.rotation.y = d.data.rotation
+    // 重置整个欧拉角:只设 rotation.y 会让倒下时的 x/z 分量残留,
+    // mesh.quaternion 仍保持倒下姿态(复原后主循环不再同步 mesh)
+    d.mesh.rotation.set(0, d.data.rotation, 0)
   }
 }
 
